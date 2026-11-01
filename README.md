@@ -1,12 +1,13 @@
-# Early Click Buffer (Geode mod)
+# OP Click Buffer (Geode mod)
 
-Click a hair too early and your input waits a few physics ticks until it won't kill you.
+Keeps the game's button state equal to what you're holding whenever that wouldn't kill you, and when it would, simulates ahead with an invisible copy of your icon to find a timing that survives:
 
-On every click the mod simulates the next ticks with an invisible copy of your icon:
-1. Simulate clicking **now**. If you live, the click goes straight through.
-2. If you'd die, try clicking 1, 2, 3 … up to *Max Delay* ticks later.
-3. The first delay that survives (and still actually jumps, if the on-time click would have) wins: your click is held exactly that long, then handed to the game.
-4. If nothing within the window survives, the click goes through untouched.
+- early click → held until safe
+- lethal click → dropped
+- early release → held until letting go is safe
+- missed click → if doing nothing dies within the rescue window, the latest surviving press/release/tap is injected for you
+
+See `about.md` for details and limits.
 
 Targets **Geometry Dash 2.2081** with **Geode 5.11.2** (Windows, Android, macOS, iOS).
 
@@ -31,7 +32,7 @@ The .geode ends up in `build/`.
 
 ## Files
 
-- `src/main.cpp` – the mod
+- `src/main.cpp` – the mod (Simulator = ghost physics, AssistPlayLayer = planner)
 - `src/PlayerCopy.inc` – generated list of PlayerObject physics fields the ghost copies
 - `tools/gen_player_copy.py` – regenerates it from the Geode bindings if GD updates
 - `mod.json` – metadata and settings

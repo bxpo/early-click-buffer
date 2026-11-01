@@ -1,20 +1,23 @@
-# Early Click Buffer
+# OP Click Buffer
 
-Clicked a hair too early and died? This mod catches that.
+Every tick the mod keeps two things in mind: what you're **holding** and what the **game** has. It keeps them equal whenever that wouldn't kill you. When it would, it runs the game's own physics on an invisible copy of your icon and finds a timing that survives.
 
-Every time you click, the mod quietly plays out the next few ticks on an invisible copy of your icon. If clicking **right now** would kill you, but clicking a tick or a few later wouldn't, your click is held for exactly that long and then goes through. If no small delay would save you, nothing changes and you die like normal.
+## What it fixes
+- **Early click** – held back until the tick it stops being lethal.
+- **Wrong click** – if no delay makes it safe, it never reaches the game.
+- **Early release** – the button stays held (orb chains, wave) until letting go is safe.
+- **Missed click** – if doing nothing would kill you within the rescue window, the mod presses, releases or taps for you at the latest moment that still survives.
 
-## Works in
-- **Cube, ball, robot, spider** – early clicks before landing or before an orb
-- **UFO** – early flaps
-- **Wave** – presses *and* releases (releases can be turned off)
-- **Dual** (normal one-player duals): both icons are checked
+Works in every gamemode and in normal duals. Platformer and 2-player levels are left alone.
 
-Ship and swing are never touched (delaying steering just feels laggy), and neither are platformer or 2-player levels.
+## Settings worth knowing
+- **Rescue Window** – how close a death has to be before the mod takes over. 32 ticks (≈0.13 s) means you stay in control until roughly human-reaction time before dying.
+- **Max Input Delay** – how long your own clicks are retried every tick before backing off.
+- **Auto-Rescue** – turn this off to go back to just click buffering.
 
-## Settings
-- **Max Delay** – how far a click can be pushed back. 240 ticks = 1 second, so 4 ticks = one frame at 60 FPS. Default 6.
-- **Buffer Wave Releases**, **Lookahead**, **Time Budget**, **Show Indicator**, **Log Saved Clicks**
+## Limits
+- Moving objects are treated as standing still during prediction, so moving hazards can still get you.
+- Prediction stops at gamemode/speed/mirror/dual/teleport portals and counts reaching them as surviving.
+- Only one change of direction is searched per rescue, so a section that needs a precise *sequence* of inputs can still kill you if you give it nothing.
 
-## Heads up
-This changes your inputs, so treat it like any other assist/hack: runs made with it won't count for leaderboards or list verification. Turn off Click Between Frames while using it, since both mess with input timing.
+This changes your inputs, so runs with it won't count for leaderboards or list verification. Don't run it with Click Between Frames.

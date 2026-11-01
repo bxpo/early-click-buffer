@@ -1,10 +1,19 @@
-// Early Click Buffer
+// OP Click Buffer
 //
-// When you press (or, in wave, release) jump, the mod runs the next few physics
-// ticks on an invisible copy of your player. If acting right now would kill you
-// but acting a tick or a few later would not, your input is held for exactly
-// that many ticks and then handed to the game. If no small delay saves you, the
-// input goes through untouched.
+// Every physics tick the mod knows two things: what button state you are
+// physically holding ("desired") and what the game currently has ("applied").
+// It keeps them equal whenever that would not kill you, and when it would,
+// it runs the game's own physics on an invisible copy of your icon to find a
+// different input timing that survives:
+//
+//   * early click   -> held back until the tick it stops being lethal
+//   * wrong click   -> dropped if no delay makes it safe
+//   * early release -> the button stays held until letting go is safe
+//   * missed click  -> if doing nothing would kill you within the rescue
+//                      window, the latest press / release / tap that
+//                      survives is injected for you
+//
+// If the search finds nothing that survives, you die like normal.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
@@ -18,121 +27,76 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <deque>
 #include <unordered_set>
 #include <vector>
 
 using namespace geode::prelude;
 
-namespace ecb {
+namespace ocb {
 
 // ---------------------------------------------------------------- settings
 
 struct Config {
     bool enabled = true;
-    int maxDelay = 6;
-    bool bufferReleases = true;
-    int lookahead = 90;
-    double budgetMs = 6.0;
+    int maxInputDelay = 24;
+    bool rescue = true;
+    int rescueWindow = 32;
+    int lookahead = 96;
+    bool assistShipSwing = true;
+    double budgetMs = 8.0;
     bool showIndicator = true;
-    bool logSaves = false;
+    bool logActions = false;
 };
 
 static Config readConfig() {
     auto mod = Mod::get();
     Config c;
     c.enabled = mod->getSettingValue<bool>("enabled");
-    c.maxDelay = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("max-delay"), 1, 24));
-    c.bufferReleases = mod->getSettingValue<bool>("buffer-wave-releases");
-    c.lookahead = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("lookahead"), 30, 240));
-    c.budgetMs = std::clamp(mod->getSettingValue<double>("time-budget"), 1.0, 16.0);
+    c.maxInputDelay = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("max-input-delay"), 0, 120));
+    c.rescue = mod->getSettingValue<bool>("rescue");
+    c.rescueWindow = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("rescue-window"), 4, 120));
+    c.lookahead = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("lookahead"), 32, 240));
+    c.lookahead = std::max(c.lookahead, c.rescueWindow + 16);
+    c.assistShipSwing = mod->getSettingValue<bool>("assist-ship-swing");
+    c.budgetMs = std::clamp(mod->getSettingValue<double>("time-budget"), 1.0, 30.0);
     c.showIndicator = mod->getSettingValue<bool>("show-indicator");
-    c.logSaves = mod->getSettingValue<bool>("log-saves");
+    c.logActions = mod->getSettingValue<bool>("log-actions");
     return c;
-}
-
-// ---------------------------------------------------------------- gamemodes
-
-enum class Mode { Cube, Ship, Ball, Ufo, Wave, Robot, Spider, Swing };
-
-static Mode modeOf(PlayerObject const* p) {
-    if (p->m_isShip) return Mode::Ship;
-    if (p->m_isBird) return Mode::Ufo;
-    if (p->m_isBall) return Mode::Ball;
-    if (p->m_isDart) return Mode::Wave;
-    if (p->m_isRobot) return Mode::Robot;
-    if (p->m_isSpider) return Mode::Spider;
-    if (p->m_isSwing) return Mode::Swing;
-    return Mode::Cube;
-}
-
-// Modes judged one jump at a time: a prediction ends once the jump lands.
-static bool isJumpMode(Mode m) {
-    return m == Mode::Cube || m == Mode::Robot || m == Mode::Ball || m == Mode::Spider;
-}
-
-// Ship and swing are continuous steering; delaying them only feels laggy.
-static bool isBufferable(Mode m) {
-    return m != Mode::Ship && m != Mode::Swing;
 }
 
 // ---------------------------------------------------------------- player rhythm
 
-// Running averages of how the player clicks, in physics ticks (240 per second).
+// Running average of how long the player holds a click, in physics ticks
+// (240 per second). Used to model the release that follows a press.
 struct Rhythm {
     double hold = 8.0;
-    double gap = 10.0;
-    double pressInterval = 20.0;
     long long lastPress = -1;
-    long long lastRelease = -1;
-
-    static void blend(double& avg, long long sample) {
-        avg += (static_cast<double>(std::max<long long>(sample, 1)) - avg) * 0.3;
-    }
 
     void note(bool down, long long tick) {
-        constexpr long long kMaxGap = 120;
         if (down) {
-            if (lastRelease >= 0 && tick - lastRelease <= kMaxGap) blend(gap, tick - lastRelease);
-            if (lastPress >= 0 && tick - lastPress <= kMaxGap) blend(pressInterval, tick - lastPress);
             lastPress = tick;
         }
-        else {
-            if (lastPress > lastRelease && tick - lastPress <= kMaxGap) blend(hold, tick - lastPress);
-            lastRelease = tick;
+        else if (lastPress >= 0 && tick - lastPress <= 120) {
+            hold += (static_cast<double>(std::max<long long>(tick - lastPress, 1)) - hold) * 0.3;
+            lastPress = -1;
         }
     }
 
-    void reset() {
-        lastPress = -1;
-        lastRelease = -1;
-    }
-
-    int holdTicks() const { return std::clamp(static_cast<int>(std::lround(hold)), 1, 40); }
-    int gapTicks() const { return std::clamp(static_cast<int>(std::lround(gap)), 1, 40); }
-    int intervalTicks() const { return std::clamp(static_cast<int>(std::lround(pressInterval)), 2, 60); }
+    void reset() { lastPress = -1; }
+    int holdTicks() const { return std::clamp(static_cast<int>(std::lround(hold)), 2, 40); }
 };
 
 // ---------------------------------------------------------------- simulation
-
-enum class Outcome { Survived, Died, Unknown };
 
 struct SimInput {
     int tick;
     bool down;
 };
 
-struct SimRequest {
-    std::vector<SimInput> inputs; // sorted by tick; tick 0 = the tick being processed now
-    int evaluatedTick = 0;        // tick of the input under test
-    int horizon = 60;             // total ticks to run
-    int actWindow = 0;            // ticks after evaluatedTick in which the input should visibly act
-    bool jumpMode = false;        // end once an acted jump lands / reaches a new orb
-};
-
 struct SimResult {
-    Outcome outcome = Outcome::Unknown;
-    bool acted = false;
+    bool died = false;
+    int deathTick = -1;   // tick (0 = now) on which the ghost died
+    bool boundary = false; // reached a portal / trigger it can't model, alive
 };
 
 // Objects the ghost collides with exactly like the real player does.
@@ -206,7 +170,6 @@ public:
 
     void markDead() { m_dead = true; }
     void markBoundary() { m_boundary = true; }
-    void noteJump() { m_jumps++; }
 
     void setTickDelta(float dt) {
         if (dt > 0.0001f && dt < 2.f) m_dt = dt;
@@ -233,9 +196,11 @@ public:
         }
     }
 
-    // Runs the ghost(s). sources[i] is the real player ghost i stands in for.
+    // Runs the ghost(s) for `horizon` ticks. sources[i] is the real player that
+    // ghost i stands in for; `inputs` are jump-button events sorted by tick,
+    // applied to every ghost (tick 0 = the tick being processed right now).
     SimResult run(PlayLayer* pl, PlayerObject* const* sources, PlayerObject* const* ghosts, int n,
-        SimRequest const& req)
+        std::vector<SimInput> const& inputs, int horizon)
     {
         SimResult res;
         if (!pl || n <= 0) return res;
@@ -255,81 +220,25 @@ public:
             else if (sources[i] == realP2) pl->m_player2 = ghosts[i];
         }
 
-        PlayerObject* lead = ghosts[0];
-        std::vector<CCObject*> startOrbs;
-        if (auto rings = sources[0]->m_touchingRings) {
-            for (unsigned i = 0; i < rings->count(); ++i) startOrbs.push_back(rings->objectAtIndex(i));
-        }
-
-        res.outcome = Outcome::Survived;
-        bool airborneAfterAct = false;
-        int groundedTicks = 0;
         size_t next = 0;
-
-        for (int tick = 0; tick < req.horizon; ++tick) {
-            while (next < req.inputs.size() && req.inputs[next].tick <= tick) {
+        for (int tick = 0; tick < horizon; ++tick) {
+            while (next < inputs.size() && inputs[next].tick <= tick) {
                 for (int i = 0; i < n; ++i) {
-                    if (req.inputs[next].down) ghosts[i]->pushButton(PlayerButton::Jump);
+                    if (inputs[next].down) ghosts[i]->pushButton(PlayerButton::Jump);
                     else ghosts[i]->releaseButton(PlayerButton::Jump);
                 }
                 ++next;
             }
-
-            double prevY = lead->getPositionY();
-            double prevVy = lead->m_yVelocity * (lead->m_isUpsideDown ? -1.0 : 1.0);
-            bool prevFlip = lead->m_isUpsideDown;
-            bool prevDash = lead->m_isDashing;
-            int prevJumps = m_jumps;
-
             for (int i = 0; i < n && !m_dead; ++i) step(pl, ghosts[i]);
-
             if (m_dead) {
-                res.outcome = Outcome::Died;
+                res.died = true;
+                res.deathTick = tick;
                 break;
             }
-            if (m_boundary) break; // reached a portal/trigger alive: counts as survived
-            if (tick < req.evaluatedTick) continue;
-
-            // Did the input under test do something? (jump, flip, orb, dash, spider teleport)
-            if (tick <= req.evaluatedTick + req.actWindow) {
-                double vy = lead->m_yVelocity * (lead->m_isUpsideDown ? -1.0 : 1.0);
-                bool teleported = std::abs(lead->getPositionY() - prevY) > 10.0;
-                bool launched = (vy - prevVy > 2.0 && vy > 2.0) || (vy - prevVy < -4.0);
-                if (m_jumps != prevJumps || launched || teleported || lead->m_isUpsideDown != prevFlip ||
-                    (lead->m_isDashing && !prevDash))
-                {
-                    res.acted = true;
-                }
-            }
-
-            if (!req.jumpMode || !res.acted || tick <= req.evaluatedTick) continue;
-
-            // After the input has acted: reaching a new orb means the next click
-            // decides what happens, so stop there.
-            bool newOrb = false;
-            if (auto rings = lead->m_touchingRings) {
-                for (unsigned i = 0; i < rings->count() && !newOrb; ++i) {
-                    auto r = rings->objectAtIndex(i);
-                    newOrb = std::find(startOrbs.begin(), startOrbs.end(), r) == startOrbs.end();
-                }
-            }
-            if (newOrb) break;
-
-            // ...and a few safe ticks on the ground after the jump means it worked.
-            if (!lead->m_isOnGround) {
-                airborneAfterAct = true;
-                groundedTicks = 0;
-            }
-            else if (airborneAfterAct && ++groundedTicks >= 3) {
+            if (m_boundary) {
+                res.boundary = true;
                 break;
             }
-        }
-
-        if (res.outcome == Outcome::Survived && !m_boundary && req.jumpMode && !lead->m_isOnGround &&
-            !lead->m_isDashing && airborneAfterAct)
-        {
-            // Ran out of lookahead mid-air: nothing proves this timing is safe.
-            res.outcome = Outcome::Unknown;
         }
 
         pl->m_player1 = realP1;
@@ -476,7 +385,6 @@ private:
     bool m_running = false;
     bool m_dead = false;
     bool m_boundary = false;
-    int m_jumps = 0;
     float m_dt = 0.25f;
     PlayerObject* m_ghosts[2] = { nullptr, nullptr };
 
@@ -491,33 +399,43 @@ private:
 };
 
 static bool g_injecting = false;
-// True while the game is inside a physics tick. An input that arrives outside one
-// (between frames) is applied on the next tick, so it needs one extra tick of wait.
-static bool g_inTick = false;
 
-} // namespace ecb
+} // namespace ocb
 
-using namespace ecb;
+using namespace ocb;
 
 // ---------------------------------------------------------------- PlayLayer
 
-class $modify(BufferPlayLayer, PlayLayer) {
+class $modify(AssistPlayLayer, PlayLayer) {
     struct Fields {
         Ref<PlayerObject> ghost1;
         Ref<PlayerObject> ghost2;
         Ref<CCLabelBMFont> label;
-
-        struct Event {
-            bool down;
-            bool isP1;
-        };
-        std::deque<Event> queue; // inputs being held back, oldest first
-        int ticksLeft = 0;       // ticks until queue[0] is released
-        long long tick = 0;      // physics ticks since the attempt started
-        Rhythm rhythm;
-        int lastSaved = 0;
-        float labelFade = 0.f;
         Config cfg;
+
+        long long tick = 0;        // physics ticks since the attempt started
+        bool desired = false;      // what the player is physically holding
+        bool applied = false;      // what the game currently has
+        long long desiredSince = 0;
+        long long nextCheck = 0;   // next tick to run the "do nothing" death check
+        Rhythm rhythm;
+
+        // A rescue the mod decided on: toggle at t1, optionally toggle back at t2.
+        struct Plan {
+            bool active = false;
+            long long t1 = 0;
+            bool s1 = false;
+            bool fired1 = false;
+            bool has2 = false;
+            long long t2 = 0;
+            bool s2 = false;
+        } plan;
+
+        int delayed = 0;  // user inputs that were held back and later applied
+        int dropped = 0;  // user inputs that never became safe
+        int rescues = 0;  // inputs the mod injected on its own
+        float flash = 0.f;
+        std::string flashText;
     };
 
     static void onModify(auto& self) {
@@ -548,7 +466,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto win = CCDirector::get()->getWinSize();
         label->setPosition({ 6.f, win.height - 4.f });
         label->setZOrder(1000);
-        label->setID("buffer-indicator"_spr);
+        label->setID("assist-indicator"_spr);
         this->addChild(label);
         f->label = label;
         refreshLabel();
@@ -560,18 +478,38 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (!f->label) return;
         f->label->setVisible(f->cfg.showIndicator);
         if (!f->cfg.showIndicator) return;
-        std::string text = f->cfg.enabled ? fmt::format("Buffer: {}t", f->cfg.maxDelay) : std::string("Buffer: off");
-        if (f->labelFade > 0.f) text += fmt::format("  saved +{}t", f->lastSaved);
+        std::string text;
+        if (!f->cfg.enabled) text = "Assist: off";
+        else text = fmt::format("Assist: on  delayed {}  dropped {}  rescued {}", f->delayed, f->dropped, f->rescues);
+        if (f->flash > 0.f) text += "  |  " + f->flashText;
         f->label->setString(text.c_str());
+    }
+
+    void flash(std::string text) {
+        auto f = m_fields.self();
+        f->flashText = std::move(text);
+        f->flash = 240.f;
+        refreshLabel();
+        if (f->cfg.logActions) log::info("[tick {}] {}", f->tick, f->flashText);
+    }
+
+    void resetState() {
+        auto f = m_fields.self();
+        f->tick = 0;
+        f->desired = false;
+        f->applied = false;
+        f->desiredSince = 0;
+        f->nextCheck = 0;
+        f->plan = {};
+        f->rhythm.reset();
+        f->delayed = f->dropped = f->rescues = 0;
+        f->flash = 0.f;
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        auto f = m_fields.self();
-        f->queue.clear();
-        f->ticksLeft = 0;
-        f->rhythm.reset();
-        f->cfg = readConfig();
+        resetState();
+        m_fields->cfg = readConfig();
         refreshLabel();
     }
 
@@ -584,8 +522,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
         PlayLayer::destroyPlayer(player, object);
         if (player && player->m_isDead) {
             auto f = m_fields.self();
-            f->queue.clear();
-            f->ticksLeft = 0;
+            f->plan = {};
+            f->applied = f->desired;
         }
     }
 
@@ -602,22 +540,30 @@ class $modify(BufferPlayLayer, PlayLayer) {
         PlayLayer::playGravityEffect(flip);
     }
 
-    // ------------------------------------------------------------ input logic
-
-    bool dualMerged() {
-        return m_gameState.m_isDualMode && m_player2 && !isTwoPlayer();
-    }
+    // ------------------------------------------------------------ helpers
 
     bool isTwoPlayer() {
         return m_levelSettings && m_levelSettings->m_twoPlayerMode;
     }
 
-    // Returns how many ticks to hold this input back (0 = let it through now).
-    int chooseDelay(bool down) {
-        auto f = m_fields.self();
-        auto const& cfg = f->cfg;
-        if (!f->ghost1 || !m_player1) return 0;
+    bool dualMerged() {
+        return m_gameState.m_isDualMode && m_player2 && !isTwoPlayer();
+    }
 
+    bool assistActive() {
+        auto f = m_fields.self();
+        if (!f->cfg.enabled || !f->ghost1 || m_isPlatformer || isTwoPlayer()) return false;
+        if (!m_player1 || m_player1->m_isDead || m_hasCompletedLevel) return false;
+        if (!f->cfg.assistShipSwing) {
+            if (m_player1->m_isShip || m_player1->m_isSwing) return false;
+            if (dualMerged() && (m_player2->m_isShip || m_player2->m_isSwing)) return false;
+        }
+        return true;
+    }
+
+    // Simulates the given button events on top of the game's current state.
+    SimResult simulate(std::vector<SimInput> const& inputs, int horizon) {
+        auto f = m_fields.self();
         PlayerObject* sources[2] = { m_player1, nullptr };
         PlayerObject* ghosts[2] = { f->ghost1, f->ghost2 };
         int n = 1;
@@ -625,48 +571,36 @@ class $modify(BufferPlayLayer, PlayLayer) {
             sources[1] = m_player2;
             n = 2;
         }
+        return Simulator::get().run(this, sources, ghosts, n, inputs, horizon);
+    }
 
-        Mode mode = modeOf(m_player1);
-        for (int i = 0; i < n; ++i) {
-            if (!isBufferable(modeOf(sources[i]))) return 0;
-        }
-        bool wave = mode == Mode::Wave;
-        if (!down && !(wave && cfg.bufferReleases)) return 0;
+    // "Switch to `state` now": the future if the player's own input is applied.
+    // A press is modelled as a tap of the player's usual length unless they have
+    // clearly been holding for longer than that already.
+    SimResult simulateSwitch(bool state, long long heldFor) {
+        auto f = m_fields.self();
+        std::vector<SimInput> in{ { 0, state } };
+        int hold = f->rhythm.holdTicks();
+        if (state && heldFor < hold) in.push_back({ hold - static_cast<int>(heldFor), false });
+        return simulate(in, f->cfg.lookahead);
+    }
 
-        auto& rhythm = f->rhythm;
-        int latest = cfg.maxDelay;
-        auto makeRequest = [&](int at) {
-            SimRequest r;
-            r.evaluatedTick = at;
-            r.inputs.push_back({ at, down });
-            if (wave) {
-                int nextIn = down ? rhythm.holdTicks() : rhythm.gapTicks();
-                r.inputs.push_back({ at + nextIn, !down });
-                r.horizon = at + std::clamp(nextIn + 4, 6, 30);
-            }
-            else if (mode == Mode::Ufo) {
-                int hold = rhythm.holdTicks();
-                int interval = std::max(hold + 1, rhythm.intervalTicks());
-                r.inputs.push_back({ at + hold, false });
-                r.horizon = at + std::clamp(interval + 4, 8, 40);
-            }
-            else {
-                int hold = rhythm.holdTicks();
-                r.inputs.push_back({ at + hold, false });
-                r.horizon = at + cfg.lookahead;
-                r.jumpMode = true;
-                r.actWindow = hold + 2;
-            }
-            return r;
-        };
+    void setApplied(bool state) {
+        auto f = m_fields.self();
+        if (f->applied == state) return;
+        f->applied = state;
+        g_injecting = true;
+        this->handleButton(state, static_cast<int>(PlayerButton::Jump), true);
+        g_injecting = false;
+    }
 
-        // Never hold an input past the moment the player's next input is due,
-        // or the delay would swallow it instead of shifting it.
-        if (wave) latest = std::min(latest, (down ? rhythm.gapTicks() : rhythm.holdTicks()) - 1);
-        if (mode == Mode::Ufo) latest = std::min(latest, rhythm.intervalTicks() - 1);
-        if (latest < 1) return 0;
+    // ------------------------------------------------------------ rescue search
 
-        auto& sim = Simulator::get();
+    // Doing nothing dies at `deathTick`. Finds the latest input change that
+    // keeps the ghost alive, or failing that the one that dies latest.
+    bool planRescue(int deathTick) {
+        auto f = m_fields.self();
+        auto const& cfg = f->cfg;
         auto started = std::chrono::steady_clock::now();
         auto overBudget = [&] {
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -674,109 +608,197 @@ class $modify(BufferPlayLayer, PlayLayer) {
             return us > static_cast<long long>(cfg.budgetMs * 1000.0);
         };
 
-        SimResult base = sim.run(this, sources, ghosts, n, makeRequest(0));
-        if (base.outcome != Outcome::Died) return 0;
+        constexpr int kLead = 2; // act at least this many ticks before the death
+        int latest = std::min(deathTick - 1 - kLead, cfg.rescueWindow);
+        if (latest < 0) latest = 0;
 
-        for (int d = 1; d <= latest && !overBudget(); ++d) {
-            SimResult r = sim.run(this, sources, ghosts, n, makeRequest(d));
-            if (r.outcome != Outcome::Survived) continue;
-            // A press that jumped on time must still jump when delayed
-            // (e.g. not get eaten because you walked off a ledge meanwhile).
-            if (down && isJumpMode(mode) && base.acted && !r.acted) continue;
-            return d;
+        bool toggled = !f->applied;
+        int hold = f->rhythm.holdTicks();
+        int backs[] = { hold, 3, 6, 12, 24, 48 };
+
+        Fields::Plan best;
+        int bestDeath = deathTick;
+        bool found = false;
+
+        auto consider = [&](int d, int back) -> bool {
+            std::vector<SimInput> in{ { d, toggled } };
+            if (back > 0) in.push_back({ d + back, !toggled });
+            SimResult r = simulate(in, cfg.lookahead);
+            if (!r.died) {
+                best = {};
+                best.active = true;
+                best.t1 = f->tick + d;
+                best.s1 = toggled;
+                if (back > 0) {
+                    best.has2 = true;
+                    best.t2 = f->tick + d + back;
+                    best.s2 = !toggled;
+                }
+                found = true;
+                return true;
+            }
+            if (r.deathTick > bestDeath) {
+                bestDeath = r.deathTick;
+                best = {};
+                best.active = true;
+                best.t1 = f->tick + d;
+                best.s1 = toggled;
+                if (back > 0) {
+                    best.has2 = true;
+                    best.t2 = f->tick + d + back;
+                    best.s2 = !toggled;
+                }
+            }
+            return false;
+        };
+
+        // Latest first, so the player keeps control for as long as possible.
+        for (int d = latest; d >= 0 && !overBudget(); --d) {
+            if (consider(d, 0)) break;
+            bool done = false;
+            for (int back : backs) {
+                if (back <= 0 || overBudget()) continue;
+                if (consider(d, back)) {
+                    done = true;
+                    break;
+                }
+            }
+            if (done) break;
         }
-        return 0;
+
+        if (!best.active) return false;
+        f->plan = best;
+        f->rescues++;
+        int d = static_cast<int>(best.t1 - f->tick);
+        flash(fmt::format("rescue: {} in {}t{}{}", best.s1 ? "press" : "release", d,
+            best.has2 ? fmt::format(", back after {}t", best.t2 - best.t1) : "",
+            found ? "" : " (partial)"));
+        return true;
     }
 
-    void fire(Fields::Event const& e) {
-        g_injecting = true;
-        this->handleButton(e.down, static_cast<int>(PlayerButton::Jump), e.isP1);
-        g_injecting = false;
-    }
+    // ------------------------------------------------------------ per tick
 
-    // Called at the start of every physics tick, before queued inputs are applied.
+    // Runs at the start of every physics tick, before the game processes inputs.
     void onTick() {
         auto f = m_fields.self();
         f->tick++;
-        if (f->labelFade > 0.f) {
-            f->labelFade -= 1.f;
-            if (f->labelFade <= 0.f) refreshLabel();
+        if (f->flash > 0.f) {
+            f->flash -= 1.f;
+            if (f->flash <= 0.f) refreshLabel();
         }
-        if (f->queue.empty()) return;
-        if (--f->ticksLeft > 0) return;
+        if (!assistActive()) {
+            if (m_player1 && m_player1->m_isDead) f->applied = f->desired;
+            else if (f->applied != f->desired) setApplied(f->desired);
+            f->plan = {};
+            return;
+        }
+        auto const& cfg = f->cfg;
 
-        // Release queued inputs in order. A press and its release must land on
-        // different ticks or the game would never see the press.
-        bool pressedP1 = false, releasedP1 = false, pressedP2 = false, releasedP2 = false;
-        while (!f->queue.empty()) {
-            auto e = f->queue.front();
-            bool& sameDir = e.isP1 ? (e.down ? pressedP1 : releasedP1) : (e.down ? pressedP2 : releasedP2);
-            bool& otherDir = e.isP1 ? (e.down ? releasedP1 : pressedP1) : (e.down ? releasedP2 : pressedP2);
-            if (otherDir) break;
-            f->queue.pop_front();
-            sameDir = true;
-            fire(e);
+        // 1. A planned rescue fires on its ticks.
+        if (f->plan.active) {
+            auto& p = f->plan;
+            bool firedNow = false;
+            if (!p.fired1 && f->tick >= p.t1) {
+                setApplied(p.s1);
+                p.fired1 = true;
+                firedNow = true;
+            }
+            if (p.fired1 && (!p.has2 || f->tick >= p.t2)) {
+                if (p.has2) setApplied(p.s2);
+                p = {};
+                f->nextCheck = f->tick + 1;
+            }
+            if (firedNow || f->plan.active) return;
         }
-        f->ticksLeft = f->queue.empty() ? 0 : 1;
+
+        // 2. Bring the game back to what the player is holding, as soon as that is safe.
+        if (f->applied != f->desired) {
+            long long age = f->tick - f->desiredSince;
+            // Retry every tick inside the delay window, then back off to save time.
+            bool test = age <= cfg.maxInputDelay || age % 4 == 0;
+            if (test) {
+                SimResult r = simulateSwitch(f->desired, age);
+                if (!r.died) {
+                    setApplied(f->desired);
+                    if (age > 0) {
+                        f->delayed++;
+                        flash(fmt::format("{} delayed {}t", f->desired ? "press" : "release", age));
+                    }
+                    f->nextCheck = f->tick + 1;
+                }
+            }
+            if (age == cfg.maxInputDelay + 1 && f->applied != f->desired) {
+                flash(fmt::format("{} still lethal after {}t, waiting", f->desired ? "press" : "release", age - 1));
+            }
+            if (f->applied != f->desired) return;
+        }
+
+        // 3. Would doing nothing kill you? Then find a way out.
+        if (!cfg.rescue || f->tick < f->nextCheck) return;
+        SimResult r = simulate({}, cfg.lookahead);
+        if (!r.died) {
+            // Safe for the whole lookahead: no need to look again until a death
+            // could sneak inside the rescue window.
+            f->nextCheck = f->tick + std::clamp(cfg.lookahead - cfg.rescueWindow - 8, 2, 24);
+            return;
+        }
+        if (r.deathTick > cfg.rescueWindow) {
+            f->nextCheck = f->tick + std::max(1, r.deathTick - cfg.rescueWindow);
+            return;
+        }
+        if (!planRescue(r.deathTick)) f->nextCheck = f->tick + 2;
     }
 
-    // Returns true if the input was taken over by the buffer.
+    // ------------------------------------------------------------ player input
+
+    // Returns true if the input must not reach the game right now.
     bool interceptInput(bool down, int button, bool isP1) {
         auto f = m_fields.self();
-        if (button != static_cast<int>(PlayerButton::Jump)) return false;
-        if (m_isPlatformer || isTwoPlayer()) return false;
-        if (!m_player1 || m_player1->m_isDead || m_hasCompletedLevel) return false;
-
-        // Something is already being held back: keep everything in order behind it.
-        if (!f->queue.empty()) {
-            auto it = std::find_if(f->queue.rbegin(), f->queue.rend(),
-                [&](Fields::Event const& e) { return e.isP1 == isP1; });
-            if (it == f->queue.rend() || it->down != down) f->queue.push_back({ down, isP1 });
-            if (isP1) f->rhythm.note(down, f->tick);
-            return true;
-        }
-        if (!isP1) return false;
-
-        // Settings can change from the pause menu mid-level.
-        f->cfg = readConfig();
-        if (!f->cfg.enabled) {
-            refreshLabel();
+        if (button != static_cast<int>(PlayerButton::Jump) || !isP1) return false;
+        f->cfg = readConfig(); // settings can change from the pause menu
+        if (!assistActive()) {
+            f->desired = f->applied = down;
             return false;
         }
 
-        int delay = chooseDelay(down);
-        f->rhythm.note(down, f->tick + delay);
-        if (delay <= 0) return false;
-
-        f->queue.push_back({ down, true });
-        f->ticksLeft = delay + (g_inTick ? 0 : 1);
-        f->lastSaved = delay;
-        f->labelFade = 240.f;
-        refreshLabel();
-        if (f->cfg.logSaves) {
-            log::info("Held {} for {} tick(s) ({:.1f} ms) - it would have killed you",
-                down ? "press" : "release", delay, delay * 1000.0 / 240.0);
+        if (f->applied != f->desired && f->desired != down) {
+            // The previous input never became safe before the player moved on.
+            f->dropped++;
+            flash(fmt::format("{} dropped (lethal for {}t)", f->desired ? "press" : "release", f->tick - f->desiredSince));
         }
-        return true;
+        f->rhythm.note(down, f->tick);
+        f->desired = down;
+        f->desiredSince = f->tick;
+        f->plan = {};
+        f->nextCheck = f->tick + 1;
+
+        if (f->applied == down) return true; // the mod already did this for you
+
+        SimResult r = simulateSwitch(down, 0);
+        if (!r.died) {
+            f->applied = down;
+            return false;
+        }
+        return true; // held back; onTick keeps retrying until it is safe
     }
 };
 
 // ---------------------------------------------------------------- GJBaseGameLayer
 
-class $modify(BufferBaseLayer, GJBaseGameLayer) {
+class $modify(AssistBaseLayer, GJBaseGameLayer) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("GJBaseGameLayer::handleButton", Priority::First);
     }
 
-    BufferPlayLayer* asBufferedPlayLayer() {
+    AssistPlayLayer* asAssisted() {
         auto pl = PlayLayer::get();
         if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) return nullptr;
-        return static_cast<BufferPlayLayer*>(pl);
+        return static_cast<AssistPlayLayer*>(pl);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
         if (!g_injecting && !Simulator::get().running()) {
-            if (auto pl = asBufferedPlayLayer()) {
+            if (auto pl = asAssisted()) {
                 if (pl->interceptInput(down, button, isPlayer1)) return;
             }
         }
@@ -785,12 +807,9 @@ class $modify(BufferBaseLayer, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (!Simulator::get().running()) {
-            if (auto pl = asBufferedPlayLayer()) pl->onTick();
+            if (auto pl = asAssisted()) pl->onTick();
         }
-        bool wasInTick = g_inTick;
-        g_inTick = true;
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-        g_inTick = wasInTick;
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int count, float dt) {
@@ -848,7 +867,7 @@ class $modify(BufferBaseLayer, GJBaseGameLayer) {
 
 // ---------------------------------------------------------------- PlayerObject
 
-class $modify(BufferPlayerObject, PlayerObject) {
+class $modify(AssistPlayerObject, PlayerObject) {
     void update(float dt) {
         auto& sim = Simulator::get();
         if (!sim.running()) {
@@ -858,10 +877,7 @@ class $modify(BufferPlayerObject, PlayerObject) {
     }
 
     void incrementJumps() {
-        if (Simulator::get().running()) {
-            Simulator::get().noteJump();
-            return;
-        }
+        if (Simulator::get().running()) return;
         PlayerObject::incrementJumps();
     }
 
@@ -898,28 +914,28 @@ class $modify(BufferPlayerObject, PlayerObject) {
 
 // ---------------------------------------------------------------- cosmetic side effects
 
-class $modify(BufferEffectObject, EffectGameObject) {
+class $modify(AssistEffectObject, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
         if (Simulator::get().running()) return;
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
 };
 
-class $modify(BufferGameObject, GameObject) {
+class $modify(AssistGameObject, GameObject) {
     void playShineEffect() {
         if (Simulator::get().running()) return;
         GameObject::playShineEffect();
     }
 };
 
-class $modify(BufferRingObject, RingObject) {
+class $modify(AssistRingObject, RingObject) {
     void spawnCircle() {
         if (Simulator::get().running()) return;
         RingObject::spawnCircle();
     }
 };
 
-class $modify(BufferHardStreak, HardStreak) {
+class $modify(AssistHardStreak, HardStreak) {
     void addPoint(cocos2d::CCPoint point) {
         if (Simulator::get().running()) return;
         HardStreak::addPoint(point);
